@@ -15,6 +15,7 @@ SPEED NOTES:
 
 import re
 import time
+from pathlib import Path
 from typing import List, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -59,7 +60,7 @@ FETCH_TIMEOUT = 6           # page fetch latency is kept short but stable
 FETCH_WORKERS = 6           # parallel page fetches
 BRAVE_ENABLED = True        # additional web coverage for better plagiarism recall
 GOOGLE_ENABLED = True       # search Google as a broader web source for plagiarism checks
-BING_ENABLED = False        # Bing scraping is slow/unreliable; left off by default
+BING_ENABLED = True         # use every available provider for broader coverage
 
 
 def _get_session():
@@ -94,6 +95,10 @@ def fetch_page(url: str, timeout: int = FETCH_TIMEOUT, max_chars: int = 20000) -
         s = _get_session()
         r = s.get(url, timeout=timeout, allow_redirects=True)
         r.raise_for_status()
+        if 'application/pdf' in r.headers.get('Content-Type', '').lower() or url.lower().split('?')[0].endswith('.pdf'):
+            from core.pdf_extractor import extract_text_from_pdf_bytes
+            extracted, _ = extract_text_from_pdf_bytes(r.content)
+            return extracted[:max_chars]
         return strip_html(r.text)[:max_chars]
     except Exception:
         return ""
@@ -105,6 +110,11 @@ def _fetch_urllib(url: str, timeout: int = FETCH_TIMEOUT, max_chars: int = 20000
         req = urllib.request.Request(url, headers=HEADERS)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read(200000)
+            content_type = resp.headers.get('Content-Type', '').lower()
+            if 'application/pdf' in content_type or url.lower().split('?')[0].endswith('.pdf'):
+                from core.pdf_extractor import extract_text_from_pdf_bytes
+                extracted, _ = extract_text_from_pdf_bytes(raw)
+                return extracted[:max_chars]
             html = raw.decode(resp.headers.get_content_charset() or 'utf-8', errors='replace')
             return strip_html(html)[:max_chars]
     except Exception:
@@ -282,6 +292,44 @@ def search_google(query: str, num: int = 5, log=None) -> List[Dict]:
     return results[:num]
 
 
+def search_openalex(query: str, num: int = 3, log=None) -> List[Dict]:
+    """Find scholarly works by title using OpenAlex's public API."""
+    results = []
+    try:
+        s = _get_session()
+        resp = s.get(
+            "https://api.openalex.org/works",
+            params={"search": query, "per-page": num},
+            timeout=SEARCH_TIMEOUT,
+        )
+        if log:
+            log(f"[openalex] status={resp.status_code} query={query!r}")
+        resp.raise_for_status()
+        for work in resp.json().get("results", []):
+            location = work.get("best_oa_location") or work.get("primary_location") or {}
+            pdf_url = (location.get("pdf_url") or "").strip()
+            landing_url = (location.get("landing_page_url") or "").strip()
+            doi_url = (work.get("doi") or "").strip()
+            url = pdf_url or landing_url or doi_url
+            if not url:
+                continue
+            title = re.sub(r"\s+", " ", str(work.get("title") or "")).strip()
+            authors = ", ".join(
+                str(author.get("author", {}).get("display_name") or "")
+                for author in work.get("authorships", [])[:3]
+            )
+            results.append({
+                "url": url,
+                "snippet": f"{title}. Authors: {authors}" if authors else title,
+                "title": title,
+                "source_type": "scholarly_paper",
+            })
+    except Exception as e:
+        if log:
+            log(f"[openalex] EXCEPTION: {e}")
+    return results[:num]
+
+
 def search_bing(query: str, num: int = 5, log=None) -> List[Dict]:
     results = []
     try:
@@ -325,33 +373,52 @@ def search_bing(query: str, num: int = 5, log=None) -> List[Dict]:
 
 
 def search_web(query: str, num: int = 5, log=None) -> List[Dict]:
-    results = search_wikipedia(query, num=max(2, num // 2), log=log)
+    providers = [
+        ('wikipedia', search_wikipedia),
+        ('duckduckgo', search_duckduckgo),
+    ]
+    if BRAVE_ENABLED:
+        providers.append(('brave', search_brave))
+    if GOOGLE_ENABLED:
+        providers.append(('google', search_google))
+    if BING_ENABLED:
+        providers.append(('bing', search_bing))
 
-    if len(results) < num:
-        ddg = search_duckduckgo(query, num, log=log)
-        for r in ddg:
-            if r['url'] not in {x['url'] for x in results}:
-                results.append(r)
+    # Query providers independently so one blocked or slow search engine does
+    # not prevent results from the other sources from being used.
+    provider_results = {}
+    with ThreadPoolExecutor(max_workers=len(providers)) as executor:
+        futures = {
+            executor.submit(provider, query, num, log): name
+            for name, provider in providers
+        }
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                provider_results[name] = future.result()
+            except Exception as e:
+                provider_results[name] = []
+                if log:
+                    log(f"[{name}] EXCEPTION: {e}")
 
-    if BRAVE_ENABLED and len(results) < num:
-        brave = search_brave(query, num, log=log)
-        for r in brave:
-            if r['url'] not in {x['url'] for x in results}:
-                results.append(r)
+    # Take turns between providers so Wikipedia cannot consume the whole
+    # result budget before other resources contribute.
+    results = []
+    seen_urls = set()
+    for index in range(num):
+        for name, _ in providers:
+            source_results = provider_results.get(name, [])
+            if index >= len(source_results):
+                continue
+            result = source_results[index]
+            url = result.get('url')
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                results.append(result)
+                if len(results) >= num:
+                    return results
 
-    if GOOGLE_ENABLED and len(results) < num:
-        google = search_google(query, num, log=log)
-        for r in google:
-            if r['url'] not in {x['url'] for x in results}:
-                results.append(r)
-
-    if BING_ENABLED and len(results) < num:
-        bing = search_bing(query, num, log=log)
-        for r in bing:
-            if r['url'] not in {x['url'] for x in results}:
-                results.append(r)
-
-    return results[:num]
+    return results
 
 
 def extract_key_sentences(text: str, max_sentences: int = 8) -> List[str]:
@@ -487,7 +554,40 @@ def _fetch_and_score(url: str, snippet: str, text: str, sentence: str, log) -> D
         return None
 
 
-def check_plagiarism_online(text: str, progress_callback=None) -> List[Dict]:
+def extract_document_title(text: str, document_meta: Dict | None = None) -> str:
+    """Return the strongest available title candidate for source discovery."""
+    document_meta = document_meta or {}
+    metadata_title = str(document_meta.get('title') or '').strip()
+    if metadata_title:
+        return re.sub(r'\s+', ' ', metadata_title)[:200]
+
+    filename = str(document_meta.get('filename') or '').strip()
+    if filename:
+        filename_title = Path(filename).stem.replace('_', ' ').replace('-', ' ')
+        filename_title = re.sub(r'\s+', ' ', filename_title).strip()
+        if len(filename_title.split()) >= 3 and not re.fullmatch(r'[0-9a-fA-F]{8,}', filename_title):
+            return filename_title[:200]
+
+    for line in text.splitlines()[:12]:
+        candidate = re.sub(r'\s+', ' ', line).strip(' .:-')
+        words = candidate.split()
+        if 4 <= len(words) <= 20 and len(candidate) >= 25:
+            return candidate[:200]
+    return ''
+
+
+def extract_arxiv_id(document_meta: Dict | None = None) -> str:
+    """Extract a modern or legacy arXiv identifier from an uploaded filename."""
+    filename = str((document_meta or {}).get('filename') or '')
+    match = re.search(r'(?<![\w.])((?:\d{4}\.\d{4,5})(?:v\d+)?|[a-z-]+(?:\.[A-Z]{2})?/\d{7})(?![\w])', filename, re.I)
+    return match.group(1) if match else ''
+
+
+def check_plagiarism_online(
+    text: str,
+    progress_callback=None,
+    document_meta: Dict | None = None,
+) -> List[Dict]:
     """
     Speed-optimized version:
     - Fewer key sentences searched (MAX_KEY_SENTENCES)
@@ -512,6 +612,43 @@ def check_plagiarism_online(text: str, progress_callback=None) -> List[Dict]:
 
     seen_urls = set()
     tasks = []  # (url, snippet, sentence)
+    scholarly_candidates = {}
+
+    arxiv_id = extract_arxiv_id(document_meta)
+    if arxiv_id:
+        arxiv_id = re.sub(r'v\d+$', '', arxiv_id, flags=re.I)
+        arxiv_url = f'https://arxiv.org/abs/{arxiv_id}'
+        arxiv_pdf_url = f'https://arxiv.org/pdf/{arxiv_id}.pdf'
+        log(f'Identified arXiv research paper: {arxiv_id}')
+        scholarly_candidates[arxiv_pdf_url] = {
+            'url': arxiv_pdf_url,
+            'title': f'arXiv:{arxiv_id}',
+            'snippet': f'Identified paper: {arxiv_url}',
+            'source_type': 'scholarly_paper',
+            'landing_url': arxiv_url,
+        }
+        seen_urls.add(arxiv_pdf_url)
+        tasks.append((arxiv_pdf_url, f'Identified paper: {arxiv_url}', arxiv_id))
+
+    document_title = extract_document_title(text, document_meta)
+    if document_title:
+        log(f'Searching for the uploaded paper: "{document_title[:70]}…"')
+        scholarly_results = search_openalex(document_title, num=3, log=log)
+        for result in scholarly_results:
+            url = result['url']
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            scholarly_candidates[url] = result
+            tasks.append((url, result.get('snippet', ''), document_title))
+
+        title_results = search_web(f'"{document_title}"', num=RESULTS_PER_SENTENCE, log=log)
+        for result in title_results:
+            url = result['url']
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            tasks.append((url, result.get('snippet', ''), document_title))
 
     for sentence in key_sentences[:MAX_KEY_SENTENCES]:
         log(f"Searching: \"{sentence[:55]}…\"")
@@ -544,6 +681,29 @@ def check_plagiarism_online(text: str, progress_callback=None) -> List[Dict]:
                     matches.append(result)
             except Exception as e:
                 log(f"  -> worker error for {futures[future]}: {e}")
+
+    matched_urls = {match['url'] for match in matches}
+    for url, candidate in scholarly_candidates.items():
+        if url in matched_urls:
+            continue
+        # Keep the identified paper visible even when its publisher blocks
+        # automated fetching. It is not counted as similarity evidence.
+        matches.append({
+            'url': url,
+            'title': candidate.get('title') or document_title,
+            'snippet': candidate.get('snippet', ''),
+            'similarity': 0.0,
+            'tfidf_score': 0.0,
+            'ngram_score': 0.0,
+            'semantic_score': 0.0,
+            'shared_terms': [],
+            'matched_sentence': document_title,
+            'sentence_matches': [],
+            'sentences_matched_count': 0,
+            'coverage_percent': 0,
+            'source_type': 'scholarly_paper',
+            'verification_status': 'paper_identified_page_unavailable',
+        })
 
     matches.sort(key=lambda x: -x['similarity'])
     return _deduplicate(matches)[:10]

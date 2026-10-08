@@ -206,7 +206,7 @@ export default function App() {
       const res = await fetch(`${API}/check`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, meta }),
       });
       const data = await res.json();
       if (data.error) throw new Error(data.error);
@@ -253,9 +253,9 @@ export default function App() {
       setProgressPct(10);
       try {
         const res = await fetch(`${API}/extract`, { method: "POST", body: form });
-        const { text, error } = await res.json();
+        const { text, error, meta } = await res.json();
         if (error || !text) throw new Error(error || "OCR returned no text");
-        await submitText(text, { filename: file.name, type: "image" });
+        await submitText(text, { ...meta, filename: file.name, type: "image" });
       } catch (e) {
         setStage("error"); setProgress(e.message);
       }
@@ -270,9 +270,9 @@ export default function App() {
       setProgressPct(10);
       try {
         const res = await fetch(`${API}/extract`, { method: "POST", body: form });
-        const { text, error } = await res.json();
+        const { text, error, meta } = await res.json();
         if (error || !text) throw new Error(error || "PDF extraction returned no text");
-        await submitText(text, { filename: file.name, type: "pdf" });
+        await submitText(text, { ...meta, filename: file.name, type: "pdf" });
       } catch (e) {
         setStage("error"); setProgress(e.message);
       }

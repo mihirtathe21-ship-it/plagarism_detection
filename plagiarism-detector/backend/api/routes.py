@@ -72,7 +72,11 @@ def _run_check(job_id: str, text: str, meta: dict):
         sentences = extract_key_sentences(text)
 
         progress("Searching the web for matching content…")
-        sources = check_plagiarism_online(text, progress_callback=progress)
+        sources = check_plagiarism_online(
+            text,
+            document_meta=meta,
+            progress_callback=progress,
+        )
 
         progress("Computing similarity scores…")
         report = generate_single_doc_report(text, stats, sources, meta)
@@ -92,7 +96,8 @@ def _extract_text(req):
         data = req.get_json() or {}
         text = data.get("text", "").strip()
         if text:
-            return text, {"source": "text_input", "type": "text"}
+            meta = data.get("meta") or {}
+            return text, {"source": "text_input", "type": "text", **meta}
 
     text = req.form.get("text", "").strip()
     if text:
